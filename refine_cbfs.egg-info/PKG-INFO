@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: refine_cbfs
+Version: 0.2.0
+Summary: Interface between cbt_opt and hj_reachability
+Author: Sander Tonkens
+Author-email: sandertonkens@gmail.com
+Requires-Python: >=3.6
+Dynamic: author
+Dynamic: author-email
+Dynamic: requires-python
+Dynamic: summary
