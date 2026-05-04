@@ -130,19 +130,54 @@ matplotlib.rcParams.update(RCPARAMS)
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared ASIF patch: force real floats into CVXPY, guard NaN/Inf
 # ─────────────────────────────────────────────────────────────────────────────
+def _to_scalar(v):
+    """
+    Coerce any array-like with a single element to a plain Python float.
+    cbf_opt internals do `hs[0] = val_curr` which requires a true scalar,
+    not a 0-d or 1-element numpy/JAX array.
+    For multi-element arrays the value is returned unchanged so batch/grid
+    calls still work correctly.
+    """
+    v = np.asarray(v)
+    if v.size == 1:
+        return float(v.flat[0])
+    return v
+
+
+def _wrap_vf_scalar(cbf_obj):
+    """
+    Monkey-patch cbf_obj.vf so single-state calls return a plain float.
+    Safe to call multiple times (idempotent via _vf_scalar_wrapped guard).
+    """
+    if getattr(cbf_obj, '_vf_scalar_wrapped', False):
+        return cbf_obj
+    _orig = cbf_obj.vf
+    def _vf_wrapped(state, time=0.0, _f=_orig):
+        return _to_scalar(_f(state, time))
+    cbf_obj.vf = _vf_wrapped
+    cbf_obj._vf_scalar_wrapped = True
+    return cbf_obj
+
+
 def _patch_asif_for_real_values(asif_inst):
     """
     Monkey-patch an ASIF instance so set_constraint always receives real
     float64 scalars, preventing the CVXPY 'Parameter value must be real'
     error that arises when JAX returns complex-typed arrays, and clamping
     NaN / Inf from grid-boundary interpolation so OSQP never sees invalid data.
+    Also wraps the CBF's vf method to always return a plain scalar so that
+    cbf_opt's `hs[0] = val_curr` assignment never sees an array sequence.
     """
+    # Wrap the underlying CBF's vf as well
+    if hasattr(asif_inst, 'cbf'):
+        _wrap_vf_scalar(asif_inst.cbf)
+
     orig = asif_inst.set_constraint
 
     def safe_set_constraint(Lf_h, Lg_h, h):
-        Lf_h = float(np.real(Lf_h))
+        Lf_h = float(np.real(np.asarray(Lf_h).flat[0]))
         Lg_h = np.real(np.atleast_1d(Lg_h)).astype(float)
-        h    = float(np.real(h))
+        h    = float(np.real(np.asarray(h).flat[0]))
         if not np.isfinite(Lf_h):
             Lf_h = 0.0
         if not np.all(np.isfinite(Lg_h)):
@@ -1152,8 +1187,15 @@ class InvPendulumBackupController(cbf_module.BackupController):
         super().__init__(dynamics, T_backup, **kwargs)
 
     def policy(self, x, t):
-        return np.minimum(
-            np.maximum(-(self.lqr_term @ x.T).T, self.umin), self.umax)
+        x = np.atleast_2d(x)
+
+        u = -(self.lqr_term @ x.T).T
+        u = np.clip(u, self.umin, self.umax)
+
+        if u.shape[0] == 1:
+            return u[0]
+
+        return u
 
     def grad_policy(self, x, t):
         return -self.lqr_term
@@ -1161,7 +1203,9 @@ class InvPendulumBackupController(cbf_module.BackupController):
 
 class InvPendulumSafetyCBF(ControlAffineCBF):
     def vf(self, state, time=0.0):
-        return np.minimum(1 - state[..., 0] ** 2, 2 - state[..., 1] ** 2)
+        val = np.minimum(1 - state[..., 0] ** 2, 2 - state[..., 1] ** 2)
+        # cbf_opt's internals do `hs[0] = val_curr` which needs a plain scalar.
+        return _to_scalar(val)
 
     def vf_dt_partial(self, state, time=0.0):
         return 0.0
@@ -1181,9 +1225,11 @@ class InvPendulumImplicitCBF(cbf_module.ControlAffineImplicitCBF):
         super().__init__(dynamics, params, backup_controller, safety_cbf, **kwargs)
 
     def backup_vf(self, state, time=0.0):
-        return self.backup_vf_scalar * np.minimum(
+        val = self.backup_vf_scalar * np.minimum(
             (np.pi / 12) ** 2 - state[..., 0] ** 2,
-            self.delta ** 2    - state[..., 1] ** 2)
+            self.delta ** 2   - state[..., 1] ** 2
+        )
+        return _to_scalar(val)
 
     def _grad_backup_vf(self, state, time=0.0):
         dvf  = np.zeros_like(state)
@@ -1251,6 +1297,18 @@ def run_pendulum(out_dir, skip_solves=False):
                 # break_unsafe kwarg not present in this cbf_opt version
                 vf_table[i, j] = inv_pend_cbf.vf(grid_np[i, j])
     tab_cbf.vf_table = vf_table
+    # Ensure single-state vf calls return a plain float for cbf_opt internals.
+    _wrap_vf_scalar(tab_cbf)
+    _wrap_vf_scalar(inv_pend_cbf)
+
+    if not hasattr(inv_pend_cbf, "_backup_vf_scalar_wrapped"):
+        _orig_backup_vf = inv_pend_cbf.backup_vf
+
+        def _backup_vf_wrapped(state, time=0.0, _f=_orig_backup_vf):
+            return _to_scalar(_f(state, time))
+
+        inv_pend_cbf.backup_vf = _backup_vf_wrapped
+        inv_pend_cbf._backup_vf_scalar_wrapped = True
 
     brt = lambda obs: (lambda t, x: jnp.minimum(x, obs))
     solver_settings = hj.SolverSettings.with_accuracy(
@@ -1278,7 +1336,7 @@ def run_pendulum(out_dir, skip_solves=False):
         np.save(viability_path, np.array(viability_kernel_vf))
 
     # Controllers
-    nominal_policy = lambda x, t: np.atleast_1d(2.0)
+    nominal_policy = lambda x, t: (2.0 * np.ones((np.atleast_2d(x).shape[0], 1)))
     alpha = lambda x: 5 * x
 
     try:
@@ -1294,6 +1352,8 @@ def run_pendulum(out_dir, skip_solves=False):
 
     ca_tab = TabularControlAffineCBF(inv_pend, grid=grid)
     _make_tabular_real(ca_tab, target_values[-1])
+    # Ensure single-state vf calls return a plain Python float, not an array.
+    _wrap_vf_scalar(ca_tab)
     cbvf_filter = _patch_asif_for_real_values(
         ControlAffineASIF(inv_pend, ca_tab, alpha=alpha,
                           nominal_policy=nominal_policy, umin=umin, umax=umax))
