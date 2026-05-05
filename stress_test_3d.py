@@ -77,6 +77,35 @@ from cbf_opt import ControlAffineDynamics, ControlAffineCBF, ControlAffineASIF, 
 from experiment_wrapper import RolloutTrajectory, StateSpaceExperiment
 from refine_cbfs import HJControlAffineDynamics, TabularControlAffineCBF
 
+# ── Monkey-patch for experiment_wrapper off-by-one bug ────────────────────────
+# add_arrow uses np.searchsorted then indexes xdata[end_ind] without clamping,
+# so when the midpoint falls on the last sample (index == len) it raises IndexError.
+try:
+    import experiment_wrapper.rollout_trajectory as _ew_rt
+
+    def _safe_add_arrow(line, direction="right", position=None, size=15, color=None):
+        import numpy as _np
+        xdata = line.get_xdata()
+        ydata = line.get_ydata()
+        if position is None:
+            position = xdata.mean()
+        end_ind = int(_np.clip(_np.searchsorted(xdata, position), 1, len(xdata) - 1))
+        start_ind = end_ind - 1
+        if color is None:
+            color = line.get_color()
+        line.axes.annotate(
+            "",
+            xytext=(xdata[start_ind], ydata[start_ind]),
+            xy=(xdata[end_ind], ydata[end_ind]),
+            arrowprops=dict(arrowstyle="->", color=color),
+            size=size,
+        )
+
+    _ew_rt.add_arrow = _safe_add_arrow
+except Exception as _patch_err:
+    warnings.warn(f"Could not patch add_arrow in experiment_wrapper: {_patch_err}")
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Styling
 # ─────────────────────────────────────────────────────────────────────────────
@@ -221,6 +250,40 @@ def _timed_rollout(experiment, dyn, controllers):
     wall    = time.perf_counter() - t0
     n_steps = len(results.t.unique())
     return results, wall, wall / max(n_steps * len(controllers), 1)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Fallback trajectory plotter
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _plot_trajectories_manually(results_df, dyn, ax, colors, x_idx=0, y_idx=1):
+    """
+    Fallback used when StateSpaceExperiment.plot raises IndexError
+    (experiment_wrapper add_arrow off-by-one bug).  Draws one coloured line
+    per controller with a safe mid-trajectory directional arrow.
+    """
+    state_labels = dyn.STATES
+    for ctrl, color in zip(results_df.controller.unique(), colors):
+        sub = results_df[results_df.controller == ctrl]
+        ts  = sorted(sub.t.unique())
+        xs, ys = [], []
+        for t in ts:
+            row = sub[(sub.t == t) & (sub.measurement.isin(state_labels))]
+            if len(row) < len(state_labels):
+                continue
+            state_map = dict(zip(row.measurement, row.value))
+            sv = np.array([state_map.get(s, 0.0) for s in state_labels])
+            xs.append(float(sv[x_idx]))
+            ys.append(float(sv[y_idx]))
+        if not xs:
+            continue
+        xs, ys = np.array(xs), np.array(ys)
+        ax.plot(xs, ys, color=color, linewidth=2.5, label=ctrl)
+        n = len(xs)
+        if n >= 2:
+            mid = max(1, min(n // 2, n - 1))
+            ax.annotate("", xytext=(xs[mid - 1], ys[mid - 1]), xy=(xs[mid], ys[mid]),
+                        arrowprops=dict(arrowstyle="->", color=color), size=15)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -589,7 +652,7 @@ def run_2d_experiment(out_dir, skip_solves=False):
 
     cbf_params  = {"scaling": np.array([0.75, 0.5, 2.0, 0.5])}
     dyn         = Quad2DDynamics(QUAD_PARAMS, test=True)
-    dyn_jnp     = Quad2DDynamicsJNP(QUAD_PARAMS, test=True)
+    dyn_jnp     = Quad2DDynamicsJNP(QUAD_PARAMS, test=False)
     cbf_cand    = Quad2DCBF(dyn, cbf_params, test=False)
 
     grid, settings, safe_values = _build_2d_grid()
@@ -717,7 +780,12 @@ def run_2d_experiment(out_dir, skip_solves=False):
     fig, ax = plt.subplots(figsize=(8, 7))
     ss = StateSpaceExperiment("quad2d", x_indices=[0, 2], start_x=x0,
                               n_sims_per_start=1, t_sim=6)
-    ss.plot(ext_dyn, results, ax=ax, color=CHOSEN_COLORS[:3])
+    try:
+        ss.plot(ext_dyn, results, ax=ax, color=CHOSEN_COLORS[:3])
+    except (IndexError, Exception) as _e:
+        print(f"  [warn] ss.plot (2D) raised {type(_e).__name__}: {_e}; using fallback.")
+        _plot_trajectories_manually(results, ext_dyn, ax, CHOSEN_COLORS[:3],
+                                    x_idx=0, y_idx=2)
     ax.plot(*x0[[0, 2]], "x", ms=14, mew=3, color="grey", label="Start")
     ax.plot(*x_goal[[0, 2]], "o", ms=14, color="grey", label="Goal")
     ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]")
@@ -764,7 +832,7 @@ def run_3d_experiment(out_dir, skip_solves=False, fine_grid=False):
         "z_nom": 5.0, "y_nom": 5.0,
     }
     dyn         = Quad3DDynamics(QUAD_PARAMS, test=True)
-    dyn_jnp     = Quad3DDynamicsJNP(QUAD_PARAMS, test=True)
+    dyn_jnp     = Quad3DDynamicsJNP(QUAD_PARAMS, test=False)
     cbf_cand    = Quad3DCBF(dyn, cbf_params_3d, test=False)
 
     grid, settings, safe_values, res = _build_3d_grid(fine=fine_grid)
@@ -908,7 +976,12 @@ def run_3d_experiment(out_dir, skip_solves=False, fine_grid=False):
     fig, ax = plt.subplots(figsize=(8, 7))
     ss = StateSpaceExperiment("quad3d", x_indices=[2, 0], start_x=x0_3d,
                               n_sims_per_start=1, t_sim=6)
-    ss.plot(dyn, results_3d, ax=ax, color=CHOSEN_COLORS[:3])
+    try:
+        ss.plot(dyn, results_3d, ax=ax, color=CHOSEN_COLORS[:3])
+    except (IndexError, Exception) as _e:
+        print(f"  [warn] ss.plot (3D) raised {type(_e).__name__}: {_e}; using fallback.")
+        _plot_trajectories_manually(results_3d, dyn, ax, CHOSEN_COLORS[:3],
+                                    x_idx=2, y_idx=0)
     ax.plot(x0_3d[2], x0_3d[0], "x", ms=14, mew=3, color="grey", label="Start")
     ax.plot(x_goal[2], x_goal[0], "o", ms=14, color="grey", label="Goal")
     ax.set_xlabel("y [m]"); ax.set_ylabel("z [m]")
@@ -951,12 +1024,12 @@ def _make_comparison_figure(m2, m3, out_dir):
       [4] Safety violation rate during rollout (bar)
       [5] Online solve time per step (bar)
     """
-    fig = plt.figure(figsize=(18, 11))
+    fig = plt.figure(figsize=(28, 8))
     fig.suptitle(
         "2D vs 3D — refineCBF Comparison\n",
         fontsize=16, y=0.99)
 
-    gs = gridspec.GridSpec(1, 4, figure=fig, hspace=0.45, wspace=0.38)
+    gs = gridspec.GridSpec(1, 4, figure=fig, wspace=0.45)
     axes = [fig.add_subplot(gs[r, c]) for r in range(1) for c in range(4)]
 
     labels = [m2["label"], m3["label"]]
